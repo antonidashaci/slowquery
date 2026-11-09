@@ -172,15 +172,36 @@ class Shape:
     order_by: list[str] = field(default_factory=list)
     joins: list[tuple[str, str]] = field(default_factory=list)  # (table, column)
     notes: list[str] = field(default_factory=list)
+    # Column -> table, for columns written with a qualifier (`k.tarih`).
+    # Unqualified columns are absent and belong to the first table.
+    # ponytail: keyed by bare column name, so `a.x = ? AND b.x = ?` keeps only
+    # the last owner. Key by (table, column) if that shape ever shows up.
+    owner: dict[str, str] = field(default_factory=dict)
+
+
+_NOT_ALIAS = (r"(?!(?:WHERE|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|NATURAL|ON|USING|GROUP"
+              r"|ORDER|LIMIT|OFFSET|FOR|UNION)\b)")
 
 
 def read_shape(sql: str) -> Shape:
     """What the query asks of the planner: tables, filters, sort, hazards."""
     shape = Shape()
     upper = sql.upper()
+    aliases: dict[str, str] = {}
 
-    for match in re.finditer(r"\bFROM\s+([a-z_][\w.]*)", sql, re.I):
+    def own(qualifier: str | None, column: str) -> None:
+        if qualifier:
+            shape.owner[column] = aliases.get(qualifier.lower(), qualifier)
+
+    for match in re.finditer(
+        rf"\bFROM\s+([a-z_][\w.]*)(?:\s+(?:AS\s+)?{_NOT_ALIAS}([a-z_]\w*))?", sql, re.I
+    ):
         shape.tables.append(match.group(1))
+        aliases[(match.group(2) or match.group(1).split(".")[-1]).lower()] = match.group(1)
+    for match in re.finditer(
+        rf"\bJOIN\s+([a-z_][\w.]*)(?:\s+(?:AS\s+)?{_NOT_ALIAS}([a-z_]\w*))?", sql, re.I
+    ):
+        aliases[(match.group(2) or match.group(1).split(".")[-1]).lower()] = match.group(1)
     for match in re.finditer(
         r"\bJOIN\s+([a-z_][\w.]*)(?:\s+(?:AS\s+)?([a-z_]\w*))?\s+ON\s+(.+?)"
         r"(?=\bJOIN\b|\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|$)",
@@ -220,6 +241,7 @@ def read_shape(sql: str) -> Shape:
             if not column:
                 continue
             name = column.group(2) or column.group(3)
+            own(column.group(1) if column.group(2) else None, name)
             rest = predicate[column.end():].strip()
             if re.match(r"(=|IN\b|IS\b)", rest, re.I):
                 if name not in shape.equality:
@@ -236,9 +258,10 @@ def read_shape(sql: str) -> Shape:
     order = re.search(r"\bORDER\s+BY\b(.+?)(?=\bLIMIT\b|\bOFFSET\b|$)", sql, re.I | re.S)
     if order:
         for item in order.group(1).split(","):
-            name = re.match(r"\s*(?:[a-z_]\w*\s*\.\s*)?(\w+)", item, re.I)
+            name = re.match(r"\s*(?:([a-z_]\w*)\s*\.\s*)?(\w+)", item, re.I)
             if name:
-                shape.order_by.append(name.group(1))
+                shape.order_by.append(name.group(2))
+                own(name.group(1), name.group(2))
         if "LIMIT" not in upper:
             shape.notes.append(
                 "ORDER BY with no LIMIT: the whole result set is sorted before "
@@ -273,12 +296,17 @@ def suggest_indexes(sql: str) -> list[str]:
         + [c for c in shape.ranges if c not in shape.equality and c not in shape.order_by]
     )
     out: list[str] = []
-    if columns:
-        name = f"idx_{table.split('.')[-1]}_{'_'.join(columns)}"[:63]
+    # One composite per table: a column filtered through an alias belongs to
+    # the table behind that alias, not to whichever table came first.
+    per_table: dict[str, list[str]] = {}
+    for column in columns:
+        per_table.setdefault(shape.owner.get(column, table), []).append(column)
+    for owner, cols in per_table.items():
+        name = f"idx_{owner.split('.')[-1]}_{'_'.join(cols)}"[:63]
         out.append(
-            f"CREATE INDEX CONCURRENTLY {name} ON {table} ({', '.join(columns)});"
+            f"CREATE INDEX CONCURRENTLY {name} ON {owner} ({', '.join(cols)});"
         )
-    seen = set()
+    seen = {(owner, cols[0]) for owner, cols in per_table.items()}
     for joined, column in shape.joins:
         # `id` is the primary key in every schema this would help, and a PK is
         # already indexed. Suggesting it would just be noise.

@@ -236,3 +236,12 @@ def test_empty_log_exits_1_with_a_hint(tmp_path, capsys):
 
 def test_missing_file_exits_2(tmp_path):
     assert main([str(tmp_path / "nope.log")]) == 2
+
+
+def test_aliased_where_column_goes_to_the_table_behind_the_alias():
+    sql = ("SELECT u.ad, count(*) FROM urunler u JOIN siparis_kalem k "
+           "ON k.urun_id = u.id WHERE k.tarih > ? GROUP BY u.ad")
+    suggestions = suggest_indexes(sql)
+    assert not any("ON urunler" in s for s in suggestions)
+    assert "CREATE INDEX CONCURRENTLY idx_siparis_kalem_tarih ON siparis_kalem (tarih);" in suggestions
+    assert "CREATE INDEX CONCURRENTLY idx_siparis_kalem_urun_id ON siparis_kalem (urun_id);" in suggestions
